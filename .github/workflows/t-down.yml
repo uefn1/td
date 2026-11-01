@@ -1,0 +1,92 @@
+name: Torrent to Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      torrent:
+        description: 'magnetリンク または .torrentファイルのURL'
+        required: true
+        type: string
+      tag:
+        description: '作成するReleaseタグ (例: data-v1)'
+        required: true
+        type: string
+      zip_name:
+        description: '元になるzip名'
+        default: 'content.zip'
+        type: string
+
+jobs:
+  torrent-to-release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350 # GitHub Actionsは6時間上限
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y aria2 zip
+
+      - name: Download torrent
+        run: |
+          mkdir -p download
+          INPUT="${{ inputs.torrent }}"
+          
+          if [[ "$INPUT" == magnet:* ]]; then
+            echo "magnet link detected"
+            aria2c --seed-time=0 --bt-stop-timeout=30 \
+              --bt-enable-lpd=true --allow-overwrite=true \
+              -d ./download "$INPUT"
+          else
+            echo "assume .torrent URL, downloading torrent file"
+            curl -L -o meta.torrent "$INPUT"
+            aria2c --seed-time=0 --bt-stop-timeout=30 \
+              -d ./download meta.torrent
+          fi
+          
+          echo "--- downloaded ---"
+          ls -lhR download
+          du -sh download
+
+      - name: Create zip and split to 1.9GiB
+        run: |
+          ZIP_NAME="${{ inputs.zip_name }}"
+          
+          # download/の中身を全て1つのzipに。-0は無圧縮で高速化。圧縮したいなら -9 に
+          cd download
+          zip -r -0 ../${ZIP_NAME} .
+          cd ..
+          
+          ls -lh ${ZIP_NAME}
+          
+          # 1.9GiB = 1900MiB = 1992294400 bytes
+          # GitHub Releasesの上限2GBを下回るように1900Mで分割
+          # 出力: content.zip.part000, content.zip.part001 ...
+          split -b 1900M -d -a 3 ${ZIP_NAME} ${ZIP_NAME}.part
+          
+          # 拡張子を .zip.part形式に整形 (part000)
+          # splitが作る .part000 のままで要件を満たします
+          ls -lh ${ZIP_NAME}.part*
+          echo "PART_COUNT=$(ls -1 ${ZIP_NAME}.part* | wc -l)" >> $GITHUB_ENV
+
+      - name: Create GitHub Release and Upload parts
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.tag }}
+          name: Release ${{ inputs.tag }} - ${{ env.PART_COUNT }} parts
+          body: |
+            Source: `${{ inputs.torrent }}`
+            Split: 1.9GiB / part
+            Restore: `cat ${{ inputs.zip_name }}.part* > ${{ inputs.zip_name }} && unzip ${{ inputs.zip_name }}`
+          files: |
+            ${{ inputs.zip_name }}.part*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Cleanup original zip (to save artifact space)
+        run: rm -f ${{ inputs.zip_name }}
