@@ -19,74 +19,154 @@ on:
 jobs:
   torrent-to-release:
     runs-on: ubuntu-latest
-    timeout-minutes: 350 # GitHub Actionsは6時間上限
+    timeout-minutes: 350
     permissions:
       contents: write
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      # ─────────────────────────────────────────────
+      # 1. 不要なプリインストールを削除してディスク確保
+      #    標準runner 約14GB → 最大 ~45GB まで回復
+      # ─────────────────────────────────────────────
+      - name: Free disk space (action)
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: true       # /opt/hostedtoolcache (数GB)
+          android: true          # Android SDK (~10GB)
+          dotnet: true           # .NET (~2GB)
+          haskell: true          # GHC (~5GB)
+          large-packages: true   # docker images, snap 等
+          swap-storage: true     # スワップファイル削除
+
+      - name: Free disk space (manual cleanup)
+        run: |
+          echo "=== before ==="
+          df -h /
+          # Docker 関連
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /usr/local/share/boost /opt/hostedtoolcache/CodeQL || true
+          sudo docker image prune -af || true
+          # 大きいパッケージ
+          sudo apt-get clean
+          # ゴミ箱系
+          sudo rm -rf /tmp/* /var/tmp/* || true
+          echo "=== after ==="
+          df -h /
 
       - name: Install tools
         run: |
           sudo apt-get update
           sudo apt-get install -y aria2 zip
 
+      # ─────────────────────────────────────────────
+      # 2. ダウンロード (bt-stop-timeout は30秒→30分に)
+      # ─────────────────────────────────────────────
       - name: Download torrent
+        env:
+          INPUT: ${{ inputs.torrent }}
         run: |
           mkdir -p download
-          INPUT="${{ inputs.torrent }}"
-          
           if [[ "$INPUT" == magnet:* ]]; then
             echo "magnet link detected"
-            aria2c --seed-time=0 --bt-stop-timeout=30 \
-              --bt-enable-lpd=true --allow-overwrite=true \
+            aria2c --seed-time=0 --bt-stop-timeout=1800 \
+              --bt-enable-lpd=false \
+              --max-connection-per-server=16 \
+              --allow-overwrite=true \
               -d ./download "$INPUT"
           else
-            echo "assume .torrent URL, downloading torrent file"
-            curl -L -o meta.torrent "$INPUT"
-            aria2c --seed-time=0 --bt-stop-timeout=30 \
+            echo "assume .torrent URL"
+            curl -fL --connect-timeout 30 --max-time 300 -o meta.torrent "$INPUT"
+            aria2c --seed-time=0 --bt-stop-timeout=1800 \
+              --bt-enable-lpd=false \
               -d ./download meta.torrent
           fi
-          
+
           echo "--- downloaded ---"
-          ls -lhR download
           du -sh download
+          df -h /
 
-      - name: Create zip and split to 1.9GiB
-        run: |
-          ZIP_NAME="${{ inputs.zip_name }}"
-          
-          # download/の中身を全て1つのzipに。-0は無圧縮で高速化。圧縮したいなら -9 に
-          cd download
-          zip -r -0 ../${ZIP_NAME} .
-          cd ..
-          
-          ls -lh ${ZIP_NAME}
-          
-          # 1.9GiB = 1900MiB = 1992294400 bytes
-          # GitHub Releasesの上限2GBを下回るように1900Mで分割
-          # 出力: content.zip.part000, content.zip.part001 ...
-          split -b 1900M -d -a 3 ${ZIP_NAME} ${ZIP_NAME}.part
-          
-          # 拡張子を .zip.part形式に整形 (part000)
-          # splitが作る .part000 のままで要件を満たします
-          ls -lh ${ZIP_NAME}.part*
-          echo "PART_COUNT=$(ls -1 ${ZIP_NAME}.part* | wc -l)" >> $GITHUB_ENV
-
-      - name: Create GitHub Release and Upload parts
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ inputs.tag }}
-          name: Release ${{ inputs.tag }} - ${{ env.PART_COUNT }} parts
-          body: |
-            Source: `${{ inputs.torrent }}`
-            Split: 1.9GiB / part
-            Restore: `cat ${{ inputs.zip_name }}.part* > ${{ inputs.zip_name }} && unzip ${{ inputs.zip_name }}`
-          files: |
-            ${{ inputs.zip_name }}.part*
+      # ─────────────────────────────────────────────
+      # 3. zip作成 → 直後に download/ を削除（★ここが要）
+      #    これでピーク時ディスク = download + zip ではなく zip のみ
+      # ─────────────────────────────────────────────
+      - name: Create zip and free source
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ZIP_NAME: ${{ inputs.zip_name }}
+        run: |
+          set -euo pipefail
 
-      - name: Cleanup original zip (to save artifact space)
-        run: rm -f ${{ inputs.zip_name }}
+          echo "=== disk before zip ==="
+          df -h /
+
+          # 無圧縮で高速化。圧縮したいなら -0 → -9 (CPU時間とのトレードオフ)
+          ( cd download && zip -r -0 "../${ZIP_NAME}" . )
+
+          # ★ zip 完成と同時に元データを削除
+          rm -rf download
+          rm -f meta.torrent
+
+          echo "=== disk after zip cleanup ==="
+          df -h /
+          ls -lh "${ZIP_NAME}"
+
+      # ─────────────────────────────────────────────
+      # 4. 1.9GiB 分割 → 元zip削除（さらに空きを確保）
+      # ─────────────────────────────────────────────
+      - name: Split to 1.9GiB parts
+        env:
+          ZIP_NAME: ${{ inputs.zip_name }}
+        run: |
+          set -euo pipefail
+
+          split -b 1900M -d -a 4 "${ZIP_NAME}" "${ZIP_NAME}.part"
+
+          # ★ 元zipはもう不要
+          rm -f "${ZIP_NAME}"
+
+          echo "=== final disk ==="
+          df -h /
+          ls -lh "${ZIP_NAME}".part*
+          echo "PART_COUNT=$(ls -1 "${ZIP_NAME}".part* | wc -l)" >> "$GITHUB_ENV"
+
+      # ─────────────────────────────────────────────
+      # 5. Release へアップロード（逐次＋リトライ版）
+      #    softprops の並列アップロードはディスク/メモリを圧迫するので
+      #    gh release upload で 1ファイルずつ上げる
+      # ─────────────────────────────────────────────
+      - name: Create draft release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ inputs.tag }}
+          ZIP_NAME: ${{ inputs.zip_name }}
+          SRC: ${{ inputs.torrent }}
+        run: |
+          gh release create "$TAG" \
+            --draft \
+            --title "Release $TAG - ${PART_COUNT} parts" \
+            --notes "Source: \`$SRC\`
+          Restore: \`cat ${ZIP_NAME}.part* > ${ZIP_NAME} && unzip ${ZIP_NAME}\`"
+
+      - name: Upload assets one by one
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ inputs.tag }}
+          ZIP_NAME: ${{ inputs.zip_name }}
+        run: |
+          set -euo pipefail
+          for f in "${ZIP_NAME}".part*; do
+            echo "▶ uploading $f ..."
+            for attempt in 1 2 3; do
+              if gh release upload "$TAG" "$f" --clobber; then
+                break
+              fi
+              echo "retry $attempt for $f"
+              sleep 10
+              [[ $attempt -eq 3 ]] && exit 1
+            done
+          done
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ inputs.tag }}
+        run: gh release edit "$TAG" --draft=false
