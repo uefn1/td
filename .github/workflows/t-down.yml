@@ -120,23 +120,34 @@ jobs:
           ls -lh "${ZIP_NAME}"
 
       # ─────────────────────────────────────────────
-      # 5. 1.9GiB 分割 → 元zip削除
+      # 5. 1900MiB 超のみ 1.9GiB 分割 → 元zip削除
       # ─────────────────────────────────────────────
-      - name: Split to 1.9GiB parts
+      - name: Split to 1.9GiB parts (if needed)
         env:
           ZIP_NAME: ${{ inputs.zip_name }}
         run: |
           set -euo pipefail
 
-          split -b 1900M -d -a 4 "${ZIP_NAME}" "${ZIP_NAME}.part"
+          # 1900MiB = 1900 * 1024 * 1024 = 1,992,294,400 bytes
+          MAX_BYTES=$((1900 * 1024 * 1024))
+          SIZE=$(stat -c%s "${ZIP_NAME}")
+          echo "zip size: ${SIZE} bytes (threshold: ${MAX_BYTES})"
 
-          # ★ 元zipはもう不要
-          rm -f "${ZIP_NAME}"
+          if (( SIZE <= MAX_BYTES )); then
+            echo "size <= 1900MiB → skip split"
+            echo "SPLIT=false" >> "$GITHUB_ENV"
+            echo "PART_COUNT=1" >> "$GITHUB_ENV"
+          else
+            echo "size > 1900MiB → splitting"
+            split -b 1900M -d -a 4 "${ZIP_NAME}" "${ZIP_NAME}.part"
+            rm -f "${ZIP_NAME}"     # ★ 元zip即削除（分割時のみ）
+            echo "SPLIT=true" >> "$GITHUB_ENV"
+            echo "PART_COUNT=$(ls -1 "${ZIP_NAME}".part* | wc -l)" >> "$GITHUB_ENV"
+          fi
 
           echo "=== final disk ==="
           df -h /
-          ls -lh "${ZIP_NAME}".part*
-          echo "PART_COUNT=$(ls -1 "${ZIP_NAME}".part* | wc -l)" >> "$GITHUB_ENV"
+          ls -lh
 
       # ─────────────────────────────────────────────
       # 6. Draft Release 作成 → 逐次アップロード → Publish
@@ -147,22 +158,40 @@ jobs:
           TAG: ${{ inputs.tag }}
           ZIP_NAME: ${{ inputs.zip_name }}
           SRC: ${{ inputs.torrent }}
+          SPLIT: ${{ env.SPLIT }}
         run: |
           set -euo pipefail
+
+          if [[ "$SPLIT" == "true" ]]; then
+            TITLE="Release $TAG - ${PART_COUNT} parts"
+            RESTORE="cat ${ZIP_NAME}.part* > ${ZIP_NAME} && unzip ${ZIP_NAME}"
+          else
+            TITLE="Release $TAG - single file"
+            RESTORE="unzip ${ZIP_NAME}"
+          fi
+
           gh release create "$TAG" \
             --draft \
-            --title "Release $TAG - ${PART_COUNT} parts" \
+            --title "$TITLE" \
             --notes "Source: \`$SRC\`
-          Restore: \`cat ${ZIP_NAME}.part* > ${ZIP_NAME} && unzip ${ZIP_NAME}\`"
+          Restore: \`${RESTORE}\`"
 
       - name: Upload assets one by one
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ inputs.tag }}
           ZIP_NAME: ${{ inputs.zip_name }}
+          SPLIT: ${{ env.SPLIT }}
         run: |
           set -euo pipefail
-          for f in "${ZIP_NAME}".part*; do
+
+          if [[ "$SPLIT" == "true" ]]; then
+            FILES=( "${ZIP_NAME}".part* )
+          else
+            FILES=( "${ZIP_NAME}" )
+          fi
+
+          for f in "${FILES[@]}"; do
             echo "▶ uploading $f ..."
             uploaded=0
             for attempt in 1 2 3; do
