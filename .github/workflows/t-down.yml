@@ -26,32 +26,43 @@ jobs:
     steps:
       # ─────────────────────────────────────────────
       # 1. 不要なプリインストールを削除してディスク確保
-      #    標準runner 約14GB → 最大 ~45GB まで回復
       # ─────────────────────────────────────────────
       - name: Free disk space (action)
         uses: jlumbroso/free-disk-space@main
         with:
-          tool-cache: true       # /opt/hostedtoolcache (数GB)
-          android: true          # Android SDK (~10GB)
-          dotnet: true           # .NET (~2GB)
-          haskell: true          # GHC (~5GB)
-          large-packages: true   # docker images, snap 等
-          swap-storage: true     # スワップファイル削除
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          swap-storage: true
 
       - name: Free disk space (manual cleanup)
         run: |
           echo "=== before ==="
           df -h /
-          # Docker 関連
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
                       /usr/local/share/boost /opt/hostedtoolcache/CodeQL || true
           sudo docker image prune -af || true
-          # 大きいパッケージ
           sudo apt-get clean
-          # ゴミ箱系
           sudo rm -rf /tmp/* /var/tmp/* || true
           echo "=== after ==="
           df -h /
+
+      # ─────────────────────────────────────────────
+      # 2. gh が .git を要求するため metadata のみ checkout
+      # ─────────────────────────────────────────────
+      - name: Checkout (git metadata only)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          sparse-checkout: .
+          persist-credentials: false
+
+      - name: Verify git metadata
+        run: |
+          ls -la .git >/dev/null && echo ".git OK"
+          git remote -v
 
       - name: Install tools
         run: |
@@ -59,12 +70,13 @@ jobs:
           sudo apt-get install -y aria2 zip
 
       # ─────────────────────────────────────────────
-      # 2. ダウンロード (bt-stop-timeout は30秒→30分に)
+      # 3. ダウンロード
       # ─────────────────────────────────────────────
       - name: Download torrent
         env:
           INPUT: ${{ inputs.torrent }}
         run: |
+          set -euo pipefail
           mkdir -p download
           if [[ "$INPUT" == magnet:* ]]; then
             echo "magnet link detected"
@@ -86,8 +98,7 @@ jobs:
           df -h /
 
       # ─────────────────────────────────────────────
-      # 3. zip作成 → 直後に download/ を削除（★ここが要）
-      #    これでピーク時ディスク = download + zip ではなく zip のみ
+      # 4. zip 作成 → 直後に download/ を削除
       # ─────────────────────────────────────────────
       - name: Create zip and free source
         env:
@@ -98,10 +109,9 @@ jobs:
           echo "=== disk before zip ==="
           df -h /
 
-          # 無圧縮で高速化。圧縮したいなら -0 → -9 (CPU時間とのトレードオフ)
           ( cd download && zip -r -0 "../${ZIP_NAME}" . )
 
-          # ★ zip 完成と同時に元データを削除
+          # ★ 元データ即削除
           rm -rf download
           rm -f meta.torrent
 
@@ -110,7 +120,7 @@ jobs:
           ls -lh "${ZIP_NAME}"
 
       # ─────────────────────────────────────────────
-      # 4. 1.9GiB 分割 → 元zip削除（さらに空きを確保）
+      # 5. 1.9GiB 分割 → 元zip削除
       # ─────────────────────────────────────────────
       - name: Split to 1.9GiB parts
         env:
@@ -129,9 +139,7 @@ jobs:
           echo "PART_COUNT=$(ls -1 "${ZIP_NAME}".part* | wc -l)" >> "$GITHUB_ENV"
 
       # ─────────────────────────────────────────────
-      # 5. Release へアップロード（逐次＋リトライ版）
-      #    softprops の並列アップロードはディスク/メモリを圧迫するので
-      #    gh release upload で 1ファイルずつ上げる
+      # 6. Draft Release 作成 → 逐次アップロード → Publish
       # ─────────────────────────────────────────────
       - name: Create draft release
         env:
@@ -140,6 +148,7 @@ jobs:
           ZIP_NAME: ${{ inputs.zip_name }}
           SRC: ${{ inputs.torrent }}
         run: |
+          set -euo pipefail
           gh release create "$TAG" \
             --draft \
             --title "Release $TAG - ${PART_COUNT} parts" \
@@ -155,14 +164,19 @@ jobs:
           set -euo pipefail
           for f in "${ZIP_NAME}".part*; do
             echo "▶ uploading $f ..."
+            uploaded=0
             for attempt in 1 2 3; do
               if gh release upload "$TAG" "$f" --clobber; then
+                uploaded=1
                 break
               fi
               echo "retry $attempt for $f"
               sleep 10
-              [[ $attempt -eq 3 ]] && exit 1
             done
+            if [[ $uploaded -ne 1 ]]; then
+              echo "failed to upload $f"
+              exit 1
+            fi
           done
 
       - name: Publish release
