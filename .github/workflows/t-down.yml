@@ -25,7 +25,7 @@ jobs:
 
     steps:
       # ─────────────────────────────────────────────
-      # 1. 不要なプリインストールを削除してディスク確保
+      # 1. ディスク確保
       # ─────────────────────────────────────────────
       - name: Free disk space (action)
         uses: jlumbroso/free-disk-space@main
@@ -50,7 +50,7 @@ jobs:
           df -h /
 
       # ─────────────────────────────────────────────
-      # 2. gh が .git を要求するため metadata のみ checkout
+      # 2. gh 用に .git のみ checkout
       # ─────────────────────────────────────────────
       - name: Checkout (git metadata only)
         uses: actions/checkout@v4
@@ -98,59 +98,73 @@ jobs:
           df -h /
 
       # ─────────────────────────────────────────────
-      # 4. zip 作成 → 直後に download/ を削除
+      # 4. 戦略決定: フラット かつ 合計 ≤ 1900MiB → raw、それ以外 → zip
       # ─────────────────────────────────────────────
-      - name: Create zip and free source
+      - name: Decide strategy (raw or zip)
+        run: |
+          set -euo pipefail
+          MAX_BYTES=$((1900 * 1024 * 1024))      # 1,992,294,400
+          TOTAL=$(du -sb download | awk '{print $1}')
+          FILE_COUNT=$(find download -type f | wc -l)
+          DIR_COUNT=$(find download -mindepth 1 -type d | wc -l)
+          echo "files: ${FILE_COUNT}, dirs: ${DIR_COUNT}, total: ${TOTAL} bytes (threshold: ${MAX_BYTES})"
+
+          if (( FILE_COUNT == 0 )); then
+            echo "ERROR: no files downloaded"
+            exit 1
+          fi
+
+          if (( TOTAL <= MAX_BYTES )) && (( DIR_COUNT == 0 )); then
+            echo "→ raw mode (flat & size <= 1900MiB, zip skipped)"
+            echo "MODE=raw" >> "$GITHUB_ENV"
+            echo "PART_COUNT=${FILE_COUNT}" >> "$GITHUB_ENV"
+          else
+            if (( DIR_COUNT > 0 )); then
+              echo "→ zip mode (nested directories detected)"
+            else
+              echo "→ zip mode (size > 1900MiB)"
+            fi
+            echo "MODE=zip" >> "$GITHUB_ENV"
+          fi
+
+      # ─────────────────────────────────────────────
+      # 5a. MODE=zip: zip → split → 元zip削除
+      # ─────────────────────────────────────────────
+      - name: Zip and split (MODE=zip)
+        if: env.MODE == 'zip'
         env:
           ZIP_NAME: ${{ inputs.zip_name }}
         run: |
           set -euo pipefail
-
           echo "=== disk before zip ==="
           df -h /
 
           ( cd download && zip -r -0 "../${ZIP_NAME}" . )
-
-          # ★ 元データ即削除
           rm -rf download
           rm -f meta.torrent
 
-          echo "=== disk after zip cleanup ==="
-          df -h /
-          ls -lh "${ZIP_NAME}"
+          split -b 1900M -d -a 4 "${ZIP_NAME}" "${ZIP_NAME}.part"
+          rm -f "${ZIP_NAME}"
 
-      # ─────────────────────────────────────────────
-      # 5. 1900MiB 超のみ 1.9GiB 分割 → 元zip削除
-      # ─────────────────────────────────────────────
-      - name: Split to 1.9GiB parts (if needed)
-        env:
-          ZIP_NAME: ${{ inputs.zip_name }}
-        run: |
-          set -euo pipefail
-
-          # 1900MiB = 1900 * 1024 * 1024 = 1,992,294,400 bytes
-          MAX_BYTES=$((1900 * 1024 * 1024))
-          SIZE=$(stat -c%s "${ZIP_NAME}")
-          echo "zip size: ${SIZE} bytes (threshold: ${MAX_BYTES})"
-
-          if (( SIZE <= MAX_BYTES )); then
-            echo "size <= 1900MiB → skip split"
-            echo "SPLIT=false" >> "$GITHUB_ENV"
-            echo "PART_COUNT=1" >> "$GITHUB_ENV"
-          else
-            echo "size > 1900MiB → splitting"
-            split -b 1900M -d -a 4 "${ZIP_NAME}" "${ZIP_NAME}.part"
-            rm -f "${ZIP_NAME}"     # ★ 元zip即削除（分割時のみ）
-            echo "SPLIT=true" >> "$GITHUB_ENV"
-            echo "PART_COUNT=$(ls -1 "${ZIP_NAME}".part* | wc -l)" >> "$GITHUB_ENV"
-          fi
+          echo "PART_COUNT=$(ls -1 "${ZIP_NAME}".part* | wc -l)" >> "$GITHUB_ENV"
 
           echo "=== final disk ==="
           df -h /
-          ls -lh
+          ls -lh "${ZIP_NAME}".part*
 
       # ─────────────────────────────────────────────
-      # 6. Draft Release 作成 → 逐次アップロード → Publish
+      # 5b. MODE=raw: download/ をそのまま使う
+      # ─────────────────────────────────────────────
+      - name: Raw mode (MODE=raw)
+        if: env.MODE == 'raw'
+        run: |
+          set -euo pipefail
+          echo "=== raw mode: files to upload ==="
+          find download -type f -printf '%s\t%p\n' | sort -k2
+          du -sh download
+
+      # ─────────────────────────────────────────────
+      # 6. Draft Release 作成
       # ─────────────────────────────────────────────
       - name: Create draft release
         env:
@@ -158,16 +172,15 @@ jobs:
           TAG: ${{ inputs.tag }}
           ZIP_NAME: ${{ inputs.zip_name }}
           SRC: ${{ inputs.torrent }}
-          SPLIT: ${{ env.SPLIT }}
+          MODE: ${{ env.MODE }}
         run: |
           set -euo pipefail
-
-          if [[ "$SPLIT" == "true" ]]; then
+          if [[ "$MODE" == "zip" ]]; then
             TITLE="Release $TAG - ${PART_COUNT} parts"
             RESTORE="cat ${ZIP_NAME}.part* > ${ZIP_NAME} && unzip ${ZIP_NAME}"
           else
-            TITLE="Release $TAG - single file"
-            RESTORE="unzip ${ZIP_NAME}"
+            TITLE="Release $TAG - ${PART_COUNT} raw files"
+            RESTORE="download all ${PART_COUNT} assets individually"
           fi
 
           gh release create "$TAG" \
@@ -176,19 +189,22 @@ jobs:
             --notes "Source: \`$SRC\`
           Restore: \`${RESTORE}\`"
 
+      # ─────────────────────────────────────────────
+      # 7. 逐次アップロード（3回リトライ）
+      # ─────────────────────────────────────────────
       - name: Upload assets one by one
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ inputs.tag }}
           ZIP_NAME: ${{ inputs.zip_name }}
-          SPLIT: ${{ env.SPLIT }}
+          MODE: ${{ env.MODE }}
         run: |
           set -euo pipefail
 
-          if [[ "$SPLIT" == "true" ]]; then
-            FILES=( "${ZIP_NAME}".part* )
+          if [[ "$MODE" == "zip" ]]; then
+            mapfile -t FILES < <(ls -1 "${ZIP_NAME}".part*)
           else
-            FILES=( "${ZIP_NAME}" )
+            mapfile -d '' -t FILES < <(find download -type f -print0 | sort -z)
           fi
 
           for f in "${FILES[@]}"; do
