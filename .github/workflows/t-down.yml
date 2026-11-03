@@ -15,6 +15,14 @@ on:
         description: '元になるzip名'
         default: 'content.zip'
         type: string
+      mode:
+        description: 'アップロード形式 (raw: zip化しない / zip: zip化して分割)'
+        required: true
+        type: choice
+        options:
+          - zip
+          - raw
+        default: zip
 
 jobs:
   torrent-to-release:
@@ -98,31 +106,35 @@ jobs:
           df -h /
 
       # ─────────────────────────────────────────────
-      # 4. 戦略決定: フラット かつ 合計 ≤ 1900MiB → raw、それ以外 → zip
+      # 4. 戦略決定:
+      #    raw 要求 かつ 合計 ≤ 1900MiB → raw
+      #    raw 要求 だが 合計 >  1900MiB → zip に強制フォールバック
+      #    zip 要求                        → zip
       # ─────────────────────────────────────────────
       - name: Decide strategy (raw or zip)
+        env:
+          REQUESTED: ${{ inputs.mode }}
         run: |
           set -euo pipefail
           MAX_BYTES=$((1900 * 1024 * 1024))      # 1,992,294,400
           TOTAL=$(du -sb download | awk '{print $1}')
           FILE_COUNT=$(find download -type f | wc -l)
-          DIR_COUNT=$(find download -mindepth 1 -type d | wc -l)
-          echo "files: ${FILE_COUNT}, dirs: ${DIR_COUNT}, total: ${TOTAL} bytes (threshold: ${MAX_BYTES})"
+          echo "requested=${REQUESTED}, files=${FILE_COUNT}, total=${TOTAL} bytes (threshold: ${MAX_BYTES})"
 
           if (( FILE_COUNT == 0 )); then
             echo "ERROR: no files downloaded"
             exit 1
           fi
 
-          if (( TOTAL <= MAX_BYTES )) && (( DIR_COUNT == 0 )); then
-            echo "→ raw mode (flat & size <= 1900MiB, zip skipped)"
+          if [[ "$REQUESTED" == "raw" ]] && (( TOTAL <= MAX_BYTES )); then
+            echo "→ raw mode (requested=raw, size OK)"
             echo "MODE=raw" >> "$GITHUB_ENV"
             echo "PART_COUNT=${FILE_COUNT}" >> "$GITHUB_ENV"
           else
-            if (( DIR_COUNT > 0 )); then
-              echo "→ zip mode (nested directories detected)"
+            if [[ "$REQUESTED" == "raw" ]]; then
+              echo "::warning::raw requested but total (${TOTAL}) > ${MAX_BYTES} → forcing zip"
             else
-              echo "→ zip mode (size > 1900MiB)"
+              echo "→ zip mode (requested=zip)"
             fi
             echo "MODE=zip" >> "$GITHUB_ENV"
           fi
@@ -159,8 +171,8 @@ jobs:
         if: env.MODE == 'raw'
         run: |
           set -euo pipefail
-          echo "=== raw mode: files to upload ==="
-          find download -type f -printf '%s\t%p\n' | sort -k2
+          echo "=== raw mode: files to upload (asset name = relative path) ==="
+          find download -type f -printf '%P\t%s\n' | sort
           du -sh download
 
       # ─────────────────────────────────────────────
@@ -180,17 +192,18 @@ jobs:
             RESTORE="cat ${ZIP_NAME}.part* > ${ZIP_NAME} && unzip ${ZIP_NAME}"
           else
             TITLE="Release $TAG - ${PART_COUNT} raw files"
-            RESTORE="download all ${PART_COUNT} assets individually"
+            RESTORE="download all ${PART_COUNT} assets individually (asset names use '/' to represent directory structure)"
           fi
 
           gh release create "$TAG" \
             --draft \
             --title "$TITLE" \
             --notes "Source: \`$SRC\`
-          Restore: \`${RESTORE}\`"
+          Restore: ${RESTORE}"
 
       # ─────────────────────────────────────────────
       # 7. 逐次アップロード（3回リトライ）
+      #    raw: 相対パスをアセット名に。'/' が拒否されたら '%2F' でリトライ
       # ─────────────────────────────────────────────
       - name: Upload assets one by one
         env:
@@ -201,28 +214,35 @@ jobs:
         run: |
           set -euo pipefail
 
-          if [[ "$MODE" == "zip" ]]; then
-            mapfile -t FILES < <(ls -1 "${ZIP_NAME}".part*)
-          else
-            mapfile -d '' -t FILES < <(find download -type f -print0 | sort -z)
-          fi
-
-          for f in "${FILES[@]}"; do
-            echo "▶ uploading $f ..."
-            uploaded=0
+          upload_one() {
+            local file="$1" name="$2" attempt
             for attempt in 1 2 3; do
-              if gh release upload "$TAG" "$f" --clobber; then
-                uploaded=1
-                break
+              if gh release upload "$TAG" "${file}#${name}" --clobber; then
+                return 0
               fi
-              echo "retry $attempt for $f"
+              echo "  retry $attempt for ${name}"
               sleep 10
             done
-            if [[ $uploaded -ne 1 ]]; then
-              echo "failed to upload $f"
-              exit 1
-            fi
-          done
+            return 1
+          }
+
+          if [[ "$MODE" == "zip" ]]; then
+            mapfile -t FILES < <(ls -1 "${ZIP_NAME}".part*)
+            for f in "${FILES[@]}"; do
+              echo "▶ uploading $f ..."
+              upload_one "$f" "$(basename "$f")" || { echo "failed: $f"; exit 1; }
+            done
+          else
+            while IFS= read -r -d '' f; do
+              rel="${f#download/}"
+              echo "▶ uploading $f as $rel ..."
+              if ! upload_one "$f" "$rel"; then
+                enc="${rel//\//%2F}"
+                echo "  ↳ retry with %2F-encoded name: $enc"
+                upload_one "$f" "$enc" || { echo "failed: $f"; exit 1; }
+              fi
+            done < <(find download -type f -print0 | sort -z)
+          fi
 
       - name: Publish release
         env:
